@@ -61,13 +61,21 @@ def build_pipeline():
     return search, reranker
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
+def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker, return_timings: bool = False):
     """Run single query through pipeline."""
+    t_start = time.perf_counter()
+
+    t0 = time.perf_counter()
     results = search.search(query)
+    search_ms = (time.perf_counter() - t0) * 1000
+
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
+    t0 = time.perf_counter()
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
+    rerank_ms = (time.perf_counter() - t0) * 1000
     contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
 
+    t0 = time.perf_counter()
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
         try:
@@ -84,6 +92,11 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             answer = contexts[0]
     else:
         answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+    gen_ms = (time.perf_counter() - t0) * 1000
+    total_ms = (time.perf_counter() - t_start) * 1000
+
+    if return_timings:
+        return answer, contexts, {"search_ms": search_ms, "rerank_ms": rerank_ms, "gen_ms": gen_ms, "total_ms": total_ms}
     return answer, contexts
 
 
@@ -92,19 +105,34 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     test_set = load_test_set()
     print(f"\n[Eval] Running {len(test_set)} queries...", flush=True)
     questions, answers, all_contexts, ground_truths = [], [], [], []
+    search_times, rerank_times, gen_times, total_times = [], [], [], []
 
     for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker)
+        answer, contexts, timings = run_query(item["question"], search, reranker, return_timings=True)
+        search_times.append(timings["search_ms"])
+        rerank_times.append(timings["rerank_ms"])
+        gen_times.append(timings["gen_ms"])
+        total_times.append(timings["total_ms"])
+
         questions.append(item["question"])
         answers.append(answer)
         all_contexts.append(contexts)
         ground_truths.append(item["ground_truth"])
         print(f"  [{i+1}/{len(test_set)}] {item['question'][:50]}...", flush=True)
 
+    latency_breakdown = {
+        "avg_search_ms": round(sum(search_times) / max(len(search_times), 1), 2),
+        "avg_rerank_ms": round(sum(rerank_times) / max(len(rerank_times), 1), 2),
+        "avg_generation_ms": round(sum(gen_times) / max(len(gen_times), 1), 2),
+        "avg_total_e2e_ms": round(sum(total_times) / max(len(total_times), 1), 2),
+    }
+
     t0 = time.time()
     print(f"\n[Eval] Running RAGAS (4 metrics × {len(test_set)} questions)...", flush=True)
     results = evaluate_ragas(questions, answers, all_contexts, ground_truths)
     print(f"  ✓ RAGAS done ({time.time()-t0:.1f}s)", flush=True)
+
+    results["latency_breakdown"] = latency_breakdown
 
     print("\n" + "=" * 60)
     print("PRODUCTION RAG SCORES")
@@ -112,6 +140,14 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
     for m in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]:
         s = results.get(m, 0)
         print(f"  {'✓' if s >= 0.75 else '✗'} {m}: {s:.4f}")
+
+    print("\n" + "=" * 60)
+    print("LATENCY BREAKDOWN REPORT")
+    print("=" * 60)
+    print(f"  • Search (BM25 + Dense + RRF): {latency_breakdown['avg_search_ms']:.1f} ms")
+    print(f"  • Reranking (Cross-Encoder)  : {latency_breakdown['avg_rerank_ms']:.1f} ms")
+    print(f"  • Generation (LLM Answer)    : {latency_breakdown['avg_generation_ms']:.1f} ms")
+    print(f"  • Total End-to-End Latency   : {latency_breakdown['avg_total_e2e_ms']:.1f} ms")
 
     failures = failure_analysis(results.get("per_question", []))
     save_report(results, failures)
